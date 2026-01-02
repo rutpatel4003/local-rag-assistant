@@ -33,8 +33,9 @@ class State(TypedDict):
 
 
 SYSTEM_PROMPT = """
-You're having a conversation with an user about excerpts of their files. Try to be helpful and answer their questions.
-If you don't know the answer, say that you don't know and try to ask clarifying questions.
+You are a strict document assistant. Use ONLY the provided context to answer. 
+If the answer is not in the context, explicitly say you cannot find it. 
+DO NOT use outside knowledge or make up facts.
 """.strip()
 
 PROMPT = """
@@ -106,6 +107,7 @@ class Chatbot:
         self.retriever = ingest_files(files)
         self.llm = ChatOllama(model=Config.Model.NAME,
                               temperature=Config.Model.TEMPERATURE,
+                              num_ctx=4096,
                               verbose=False,
                               keep_alive=1)
         self.workflow = self._create_workflow()
@@ -154,7 +156,13 @@ class Chatbot:
             if event_type == 'updates':
                 if "_retrieve" in event_data:
                     documents = event_data['_retrieve']['context']
-                    yield SourcesEvent(documents)
+                    unique_docs = []
+                    seen_content = set()
+                    for doc in documents:
+                        if doc.page_content not in seen_content:
+                            unique_docs.append(doc)
+                            seen_content.add(doc.page_content)
+                    yield SourcesEvent(unique_docs)
                 if "_generate" in event_data:
                     answer = event_data['_generate']['answer']
                     yield FinalAnswerEvent(answer.content)

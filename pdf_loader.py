@@ -18,11 +18,11 @@ def extract_pdf_content(data: bytes)->str:
     content = ""
     for page in pdf:
         text_page = page.get_textpage()
-        content = f"{text_page.get_text_bounded()}\n"
+        content += f"{text_page.get_text_bounded()}\n"
     return content
 
 def load_uploaded_file(uploaded_file: UploadedFile) -> File:
-    file_extension = Path(uploaded_file).suffix
+    file_extension = Path(uploaded_file.name).suffix
     if file_extension not in Config.ALLOWED_FILE_EXTENSIONS:
         raise ValueError(f"Invalid file extension: {file_extension} for file {uploaded_file.name}")
     if file_extension == PDF_FILE_EXTENSION:

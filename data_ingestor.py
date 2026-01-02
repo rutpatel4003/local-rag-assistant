@@ -76,6 +76,9 @@ def ingest_files(files: List[File]) -> BaseRetriever:
     for doc in documents:
         chunks.extend(_create_chunks(doc))
 
+    if not chunks:
+        raise ValueError("No text could be extracted from these files. Please check if the PDFs are empty or scanned images.")
+
     semantic_retriever = InMemoryVectorStore.from_documents(chunks, create_embeddings()).as_retriever(search_kwargs={"k":Config.Preprocessing.N_SEMANTIC_RESULTS})
 
     bm25_retriever = BM25Retriever.from_documents(chunks)
