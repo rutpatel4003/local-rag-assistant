@@ -7,13 +7,14 @@
 
 > "Because your private data shouldn't be the price for AI intelligence."
 
-**Private-RAG** is a localized Retrieval-Augmented Generation pipeline built for developers who care about data sovereignty. Forget sending PDFs to a cloud API—this project runs a full-scale search and reasoning engine entirely on your own silicon.
+**Private-RAG** is a localized quirky Retrieval-Augmented Generation pipeline built for developers who care about data sovereignty. Forget sending PDFs to a cloud API-this project runs a full-scale search and reasoning engine entirely on your own silicon.
 
 ---
 
 ## 🛠 Why This Matters (The Engineering Edge)
 Most RAG "tutorials" are basic. This project implements advanced retrieval techniques used in production:
 - **Hybrid Retrieval Engine**: Combines **BM25** (keyword frequency) with **Vector Embeddings** (semantic meaning). It finds the "exact needle" even when the "haystack" is a complex technical PDF.
+- **Context Aware OCR Chat**: Past messages (history) access to model to help continue the conversation with context without mentioning it again. OCR enabled to continue talking to model with PDFs containing text in images.
 - **FlashRank Re-ranking**: We don't just grab the top 10 results; we use a secondary, specialized cross-encoder model to re-score them, ensuring the LLM only sees the most high-signal context.
 - **Graph-Based State Machine**: Built with **LangGraph**, the logic is structured as a controlled workflow rather than a messy script, allowing for predictable and debuggable AI behavior.
 
