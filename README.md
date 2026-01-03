@@ -14,10 +14,10 @@
 ## 🛠 Why This Matters (The Engineering Edge)
 Most RAG "tutorials" are basic. This project implements advanced retrieval techniques used in production:
 - **Hybrid Retrieval Engine**: Combines **BM25** (keyword frequency) with **Vector Embeddings** (semantic meaning). It finds the "exact needle" even when the "haystack" is a complex technical PDF.
-- **Context Aware OCR Chat**: Past messages (history) access to model to help continue the conversation with context without mentioning it again. OCR enabled to continue talking to model with PDFs containing text in images.
+- **Context Aware OCR Chat**: Past messages (history) access to model to help continue the conversation with context without mentioning it again. OCR enabled to continue talking to model with PDFs containing text in images (tables and latex support aswell).
 - **FlashRank Re-ranking**: We don't just grab the top 10 results; we use a secondary, specialized cross-encoder model to re-score them, ensuring the LLM only sees the most high-signal context.
 - **Graph-Based State Machine**: Built with **LangGraph**, the logic is structured as a controlled workflow rather than a messy script, allowing for predictable and debuggable AI behavior.
-
+- **Self Correcting Behavior**: The LLM grades the retrieved documents and self corrects itself in case of poor document fetching, allowing for a more reliable and accurate final response.
 ---
 
 ## ⚙️ Configuration & Hardware Tuning
@@ -46,8 +46,8 @@ ollama pull qwen3:4b
 ### 2. The Setup 
 ```bash
 # Clone the vision
-git clone [https://github.com/YOUR_USERNAME/private-rag.git](https://github.com/YOUR_USERNAME/private-rag.git)
-cd private-rag
+git clone [https://github.com/rutpatel4003/local-rag-assistant.git](https://github.com/rutpatel4003/local-rag-assistant.git)
+cd local-rag-assistant
 
 # Install dependencies
 pip install -r requirements.txt
