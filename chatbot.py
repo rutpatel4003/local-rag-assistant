@@ -1,6 +1,6 @@
 from pdf_loader import File
 from data_ingestor import ingest_files
-from typing import List, TypedDict, Iterable
+from typing import List, TypedDict, Iterable, Literal
 from enum import Enum
 from config import Config
 from dataclasses import dataclass
@@ -31,6 +31,7 @@ class State(TypedDict):
     chat_history: List[BaseMessage]
     context: List[Document]
     answer: str
+    retry_count: int 
 
 
 SYSTEM_PROMPT = """
@@ -39,6 +40,7 @@ You are a highly precise technical expert. Answer the question using ONLY the pr
 - DO NOT use filler phrases like "Based on the context" or "According to the excerpts."
 - If the answer is not in the context, state: "Information not found in document."
 - Format math using LaTeX.
+- Do NOT use outside knowledge.
 """.strip()
 
 PROMPT = """
@@ -65,6 +67,14 @@ FILE_TEMPLATE = """
     <content>{content}</content>
 </file>
 """.strip()
+
+GRADER_SYSTEM_PROMPT = """
+You are a grader assessing relevance of a retrieved document to a user question. 
+If the document contains keyword(s) or semantic meaning related to the question, grade it as relevant. 
+The question does not have to be exactly the same or too specific when checking it with the context for it to be relevant, it can be a broad question with similar semantic meaning too if it makes sense. For example, a question might be based for mathematical reasoning, so check if the context contains the mathematical terms, do not just discard it if it looks gibberish without proper reasoning.
+Give a binary score 'yes' or 'no' score to indicate whether the document is relevant to the question.
+Provide the binary score as a JSON with a single key 'score' and no preamble or explanation.
+"""
 
 PROMPT_TEMPLATE = ChatPromptTemplate.from_messages(
     [
@@ -123,10 +133,49 @@ class Chatbot:
         return "\n\n".join(FILE_TEMPLATE.format(name=doc.metadata['source'], content=doc.page_content) for doc in docs)
     
     def _retrieve(self, state: State):
+        print(f"RETRIEVING: {state['question']}")
         context = self.retriever.invoke(state['question'])
         return {"context": context}
+    
+    def _grade_documents(self, state: State):
+        """
+        Filter out irrelevant documents.
+        """
+        print('Document Relevance Checking in Process!')
+        question = state['question']
+        documents = state['context']
+        prompt = ChatPromptTemplate.from_messages([
+            ('system', GRADER_SYSTEM_PROMPT),
+            ('human', 'Retrieved document: \n\n {document} \n\n User question: {question}'),
+        ])
+        grader_chain = prompt | self.llm | StrOutputParser()
+        filtered_docs = []
+        for d in documents:
+            try: # try-except block in case of garbage json output
+                score = grader_chain.invoke({'question': question, 'document': d.page_content})
+                if "yes" in score.lower():
+                    filtered_docs.append(d)
+            except:
+                continue
+        return {'context': filtered_docs}
+    
+    def _transform_query(self, state: State):
+        """
+        Transform the query to produce a better question
+        """
+        print("Transforming Query!")
+        question = state['question']
+        prompt = ChatPromptTemplate.from_messages([
+            ("system", "You are generating a better search query for a vector database. Rephrase the input question to be more specific. Just rephrase the input question, do not add any preamble or explanation, your output should only contain the rephrased question, nothing else."),
+            ("human", f"Look at the input and try to reason about the underlying semantic intent / meaning. \n\n Initial Question: {question} \n\n Formulate an improved question: "),
+        ])
+        chain = prompt | self.llm | StrOutputParser()
+        better_question = chain.invoke({})
+        current_retry = state.get('retry_count', 0)
+        return {'question': better_question, 'retry_count': current_retry+1}
 
     def _generate(self, state: State):
+        print('Generating Answer!')
         messages = PROMPT_TEMPLATE.invoke(
             {
                 "question": state['question'],
@@ -136,6 +185,21 @@ class Chatbot:
         )
         answer = self.llm.invoke(messages)
         return {"answer": answer}
+    
+    def _decide_to_generate(self, state: State) -> Literal['_transform_query', '_generate']:
+        """
+        Determines whether to generate an answer or re-generate a question.
+        """
+        filtered_documents = state['context']
+        retry_count = state.get('retry_count', 0)
+        # if no relevant documents and not self-corrected a lot of times
+        if not filtered_documents and retry_count<1: # loop 1 time
+            print('Decision: Documents irrelevant, rerouting to transform!')
+            return '_transform_query'
+        else:
+            print('Decision: Generating Answer!')
+            return '_generate'
+
     
     def _condense_question(self, state: State):
         """
@@ -170,8 +234,19 @@ class Chatbot:
         return {"question": reformulated_question}
     
     def _create_workflow(self) -> CompiledStateGraph:
-        graph_builder = StateGraph(State).add_sequence([self._condense_question, self._retrieve, self._generate])
+        graph_builder = StateGraph(State).add_sequence([self._condense_question, self._retrieve, self._grade_documents])
+        graph_builder.add_node('_transform_query', self._transform_query)
+        graph_builder.add_node('_generate', self._generate)
         graph_builder.add_edge(START, '_condense_question')
+        graph_builder.add_conditional_edges(
+            '_grade_documents', self._decide_to_generate,
+            {
+                '_transform_query': '_transform_query',
+                '_generate': '_generate'
+            },
+        )
+        graph_builder.add_edge('_transform_query', '_retrieve')
+        graph_builder.add_edge('_generate', END)
         return graph_builder.compile()
 
     def _ask_model(
@@ -180,7 +255,7 @@ class Chatbot:
         history = [
             AIMessage(m.content) if m.role == Role.ASSISTANT else HumanMessage(m.content) for m in chat_history
         ]
-        payload = {"question": prompt, "chat_history": history}
+        payload = {"question": prompt, "chat_history": history, 'retry_count': 0}
 
         config = {
             "configurable": {"thread_id": 42}

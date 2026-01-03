@@ -1,76 +1,189 @@
 from dataclasses import dataclass
 from pathlib import Path
 import fitz  # PyMuPDF
-from rapidocr_onnxruntime import RapidOCR
 from streamlit.runtime.uploaded_file_manager import UploadedFile
 from config import Config
+import torch
+from transformers import AutoProcessor, AutoModelForImageTextToText
+from PIL import Image
 import io
 
 TEXT_FILE_EXTENSION = ".txt"
 MD_FILE_EXTENSION = '.md'
 PDF_FILE_EXTENSION = ".pdf"
 
-# initialize OCR engine once (Global load for speed)
-# use det_use_gpu=True if you have CUDA configured properly, else False is still fast
-try:
-    ocr_engine = RapidOCR(det_use_gpu=True)
-except:
-    ocr_engine = RapidOCR(det_use_gpu=False)
+# global variables for lazy loading
+_got_model = None
+_got_processor = None
 
-@dataclass 
-class File:
-    name: str
-    content: str
+def get_got_ocr_model():
+    """
+    Lazy-load GOT-OCR2 model.
+    Uses ~2.3GB VRAM with float16 precision.
+    """
+    global _got_model, _got_processor
+    
+    if _got_model is None:
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        
+        # load model normally with float16 for GPU efficiency
+        _got_model = AutoModelForImageTextToText.from_pretrained(
+            "stepfun-ai/GOT-OCR-2.0-hf",
+            dtype=torch.float16 if device == "cuda" else torch.float32,
+            device_map=device,
+        )
+        
+        _got_processor = AutoProcessor.from_pretrained(
+            "stepfun-ai/GOT-OCR-2.0-hf",
+            use_fast=True
+        )
+        
+        # set to eval mode
+        _got_model.eval()        
+        if device == "cuda":
+            print(f"  VRAM allocated: {torch.cuda.memory_allocated() / 1024**3:.2f} GB")
+        
+    return _got_model, _got_processor
 
-def extract_pdf_content(data: bytes) -> str:
+def run_got_ocr_on_image(image_bytes: bytes, format_output: bool = True) -> str:
     """
-    Iterates through the PDF block by block.
-    - If text: keeps it.
-    - If image: runs OCR and injects the text in-place.
+    Run GOT-OCR2 on image bytes and return extracted text.
     """
-    # open PDF from bytes
+    try:
+        model, processor = get_got_ocr_model()
+        
+        # convert bytes to PIL Image
+        image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+        
+        # validate image
+        if image.size[0] < 10 or image.size[1] < 10:
+            return ""  # skip tiny images
+        
+        # process image with appropriate settings
+        inputs = processor(
+            image,
+            return_tensors="pt",
+            format=format_output  # enable for lateX, tables, formulas
+        )
+        
+        # move to GPU if available
+        device = next(model.parameters()).device
+        inputs = {k: v.to(device) if isinstance(v, torch.Tensor) else v 
+                  for k, v in inputs.items()}
+        
+        # generate with memory-efficient settings
+        with torch.no_grad(): 
+            generate_ids = model.generate(
+                **inputs,
+                do_sample=False,
+                tokenizer=processor.tokenizer,
+                stop_strings="<|im_end|>",
+                max_new_tokens=2048,
+                num_beams=1,  # greedy decoding
+            )
+        
+        # decode output
+        output_text = processor.decode(
+            generate_ids[0, inputs["input_ids"].shape[1]:],
+            skip_special_tokens=True
+        )
+        
+        # clear cuda cache after each inference
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        
+        return output_text.strip()
+        
+    except Exception as e:
+        import traceback
+        print(f"GOT-OCR2 failed: {e}")
+        print(traceback.format_exc())
+        return ""
+
+def extract_pdf_content(data: bytes, use_got_ocr: bool = True) -> str:
+    """
+    Extract content from PDF with GOT-OCR2 for images.
+    """
     with fitz.open(stream=data, filetype="pdf") as doc:
         full_text = []
         
         for page_num, page in enumerate(doc):
-            # get_text("dict") allows us to separate images from text blocks
+            print(f"Processing page {page_num + 1}/{len(doc)}...")
+            
+            # extract text blocks
             blocks = page.get_text("dict", sort=True)["blocks"]
             
             for block in blocks:
-                # type 0 = Text
+                # type 0 = text block
                 if block["type"] == 0:
                     for line in block["lines"]:
                         for span in line["spans"]:
                             full_text.append(span["text"])
                     full_text.append("\n")
                 
-                # type 1 = Image
-                elif block["type"] == 1:
+                # type 1 = image block
+                elif block["type"] == 1 and use_got_ocr:
                     try:
-                        image_bytes = block["image"]
-                        # run OCR on the image bytes
-                        ocr_result, _ = ocr_engine(image_bytes)
+                        # extract image from the page region using bbox
+                        bbox = block.get("bbox")
+                        if bbox:
+                            # extract image with 2x zoom for better quality
+                            mat = fitz.Matrix(2, 2)
+                            pix = page.get_pixmap(matrix=mat, clip=bbox)
+                            image_bytes = pix.tobytes("png")
+                            
+                            # run GOT-OCR2
+                            extracted_text = run_got_ocr_on_image(
+                                image_bytes,
+                                format_output=True
+                            )
+                            
+                            if extracted_text:
+                                full_text.append(f"\n[IMAGE CONTENT]\n{extracted_text}\n[/IMAGE CONTENT]\n")
                         
-                        if ocr_result:
-                            # extract just the text parts
-                            extracted_text = " ".join([res[1] for res in ocr_result])
-                            if extracted_text.strip():
-                                full_text.append(f"\n[IMAGE CONTENT: {extracted_text}]\n")
                     except Exception as e:
-                        # fail silently on bad images to keep the pipeline moving
-                        pass
-                        
-            full_text.append("\n--- PAGE BREAK ---\n")
+                        print(f"Failed to process image on page {page_num + 1}: {e}")
             
+            full_text.append("\nPAGE BREAK\n")
     return "\n".join(full_text)
 
+@dataclass 
+class File:
+    name: str
+    content: str
+
 def load_uploaded_file(uploaded_file: UploadedFile) -> File:
+    """load and process uploaded file."""
     file_extension = Path(uploaded_file.name).suffix
+    
     if file_extension not in Config.ALLOWED_FILE_EXTENSIONS:
-        raise ValueError(f"Invalid file extension: {file_extension} for file {uploaded_file.name}")
+        raise ValueError(
+            f"Invalid file extension: {file_extension} for file {uploaded_file.name}"
+        )
     
     if file_extension == PDF_FILE_EXTENSION:
-        return File(name=uploaded_file.name, content=extract_pdf_content(uploaded_file.getvalue()))
+        return File(
+            name=uploaded_file.name,
+            content=extract_pdf_content(uploaded_file.getvalue(), use_got_ocr=True)
+        )
     
-    # text/MD fallback
-    return File(name=uploaded_file.name, content=uploaded_file.getvalue().decode("utf-8"))
+    # Text/MD fallback
+    return File(
+        name=uploaded_file.name,
+        content=uploaded_file.getvalue().decode("utf-8")
+    )
+
+# cleanup function to free GPU memory when done
+def cleanup_got_model():
+    """call this when you're done processing to free GPU memory."""
+    global _got_model, _got_processor
+    
+    if _got_model is not None:
+        del _got_model
+        del _got_processor
+        _got_model = None
+        _got_processor = None
+        
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            print("GOT-OCR2 model unloaded, GPU memory freed")

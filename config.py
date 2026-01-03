@@ -9,7 +9,6 @@ class Config:
     class Model:
             NAME = 'qwen3:4b'
             TEMPERATURE = 0.6
-            HISTORY_REPHRASER_LLM_NAME = 'qwen3:0.6b'
 
     class Preprocessing: 
         CHUNK_SIZE = 512
