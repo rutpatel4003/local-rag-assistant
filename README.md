@@ -29,9 +29,9 @@ In `config.py`, you can modify these variables to suit your needs:
 
 | Variable | Recommendation | Impact |
 | :--- | :--- | :--- |
-| `CHUNK_SIZE` | **512** | **Smaller is better** for technical exams or code snippets. **1024** is better for general prose. | Default: 1024
+| `CHUNK_SIZE` | **1024** | **Smaller is better** for technical exams or code snippets. **1024** is better for general prose. | Default: 1024
 | `CONTEXTUALIZE_CHUNKS` | **False** (Default) | Turn this to **True** if your document chunks feel "lost." It uses an LLM to explain each chunk before indexing. *Note: Increases ingestion time.* | Default: True
-| `N_CONTEXT_RESULTS` | **3 to 5** | How many sources the LLM sees. Too many can cause "Lost in the Middle" syndrome where the AI gets confused. |
+| `N_CONTEXT_RESULTS` | **3 to 5** | How many sources the LLM sees. Too many can cause "Lost in the Middle" syndrome where the AI gets confused. | Default: 4
 
 ---
 
@@ -40,7 +40,7 @@ In `config.py`, you can modify these variables to suit your needs:
 ### 1. The Brain (Ollama)
 Ensure Ollama is running and you have the model:
 ```bash
-ollama pull qwen3:4b
+ollama pull qwen3:4b-instruct
 ```
 
 ### 2. The Setup 
