@@ -1,1 +1,15 @@
-fastembed
+pymupdf
+langchain_chroma==1.1.0
+langchain_classic==1.0.1
+langchain_community==0.4.1
+langchain_core==1.2.6
+langchain_huggingface==1.2.0
+langchain_ollama==1.0.1
+langchain_text_splitters==1.1.0
+langgraph==1.0.5
+loguru==0.7.3
+pandas==2.3.3
+Pillow==12.1.0
+streamlit==1.52.2
+torch==2.9.1+cu130
+transformers==4.57.3
