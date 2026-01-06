@@ -16,6 +16,7 @@ from pdf_loader import File
 from langchain_core.output_parsers import StrOutputParser
 from langchain_core.callbacks import StreamingStdOutCallbackHandler
 import json
+import re
 
 close_tag = '</think>'
 tag_length = len(close_tag)
@@ -35,6 +36,11 @@ class State(TypedDict):
     answer: str
     retry_count: int 
 
+class QueryType(Enum):
+    STANDALONE = "standalone"       # new topic, search directly
+    FOLLOWUP = "followup"           # references history, needs condensing
+    CLARIFICATION = "clarification" # asking about previous answer
+    CHITCHAT = "chitchat" 
 
 SYSTEM_PROMPT = """
 You are a highly precise technical expert. Answer the question using ONLY the provided context.
@@ -135,8 +141,36 @@ class Chatbot:
                             callbacks=[StreamingStdOutCallbackHandler()])
         self.workflow = self._create_workflow()
 
-    def _format_docs(self, docs: List[Document]) -> str:
-        return "\n\n".join(FILE_TEMPLATE.format(name=doc.metadata['source'], content=doc.page_content) for doc in docs)
+    def _format_docs(self, docs: List[Document], max_chars_per_doc: int = 2000) -> str:
+        """
+        Format documents for LLM context - clean and truncate
+        """
+        formatted = []
+        for doc in docs:
+            content = doc.page_content
+            
+            # Remove page markers
+            content = re.sub(r'--- PAGE \d+ ---', '', content)
+            
+            # Clean context markers but keep the context text
+            content = content.replace('[CONTEXT]', '').replace('[/CONTEXT]', '')
+            content = content.replace('[TABLE:', '[TABLE:').replace('[/TABLE]', '[/TABLE]')
+            
+            # Truncate if too long
+            if len(content) > max_chars_per_doc:
+                content = content[:max_chars_per_doc] + "\n[...truncated...]"
+            
+            content = content.strip()
+            
+            formatted.append(FILE_TEMPLATE.format(
+                name=doc.metadata.get('source', 'Unknown'),
+                content=content
+            ))
+        
+        return "\n\n".join(formatted)
+
+    # def _format_docs(self, docs: List[Document]) -> str:
+    #     return "\n\n".join(FILE_TEMPLATE.format(name=doc.metadata['source'], content=doc.page_content) for doc in docs)
     
     def _retrieve(self, state: State):
         print(f"RETRIEVING: {state['question']}")
@@ -197,11 +231,14 @@ class Chatbot:
 
     def _generate(self, state: State):
         print('Generating Answer!')
+        chat_history = state['chat_history']
+        if len(chat_history) <= 1: 
+            chat_history = []
         messages = PROMPT_TEMPLATE.invoke(
             {
                 "question": state['question'],
                 "context": self._format_docs(state['context']),
-                'chat_history': state['chat_history'],
+                'chat_history': chat_history,
             }
         )
         answer = self.llm.invoke(messages)
@@ -221,38 +258,141 @@ class Chatbot:
             print('Decision: Generating Answer!')
             return '_generate'
 
+    def _classify_query(self, question: str, chat_history: List[BaseMessage]) -> QueryType:
+        """
+        Classify query type to determine processing path
+        """
+        if len(chat_history) <= 1:
+            return QueryType.STANDALONE
+        
+        # get recent context for classification
+        recent_context = ""
+        for m in chat_history[-2:]:
+            if isinstance(m, HumanMessage):
+                recent_context += f'User asked: {m.content[:100]}\n'
+            elif isinstance(m, AIMessage) and 'how can I help' not in m.content.lower():
+                recent_context += f'Assistant answered about: {m.content[:100]}\n'
+
+        classification_prompt = ChatPromptTemplate.from_messages([
+        ("system", """Classify the query into ONE category:
+
+STANDALONE - Question contains ALL information needed to answer it:
+  - Mentions specific table numbers, section names, or topics explicitly
+  - Examples: "What is table 3.1?", "What are preprocessing options for NLTK in table 3.2?", "Explain PEFT"
+  
+FOLLOWUP - Question CANNOT be understood without prior conversation:
+  - Uses pronouns (it, they, this, that) referring to unknown subject
+  - Examples: "What about the other one?", "How does it work?", "And the second table?"
+
+CLARIFICATION - Asks to expand on previous answer:
+  - Examples: "Can you explain more?", "Give an example", "What do you mean?"
+
+CHITCHAT - Greeting or thanks:
+  - Examples: "Thanks", "Hello", "Great"
+
+IMPORTANT: If the question mentions specific names, tables, or topics explicitly, it is STANDALONE even if it relates to prior discussion.
+
+Output ONLY: STANDALONE or FOLLOWUP or CLARIFICATION or CHITCHAT"""),
+        ("human", f"Recent conversation:\n{recent_context}\n\nNew query: {question}\n\nClassification:"),
+    ])
+        
+        try:
+            result = self.llm.invoke(classification_prompt.format_messages()).content.strip().upper()
+            if '</think>' in result:
+                result = result.split('</think>')[-1].strip().upper()
+
+            if 'FOLLOWUP' in result:
+                return QueryType.FOLLOWUP
+            elif 'CLARIFICATION' in result:
+                return QueryType.CLARIFICATION
+            elif 'CHITCHAT' in result:
+                return QueryType.CHITCHAT
+            return QueryType.STANDALONE
+    
+        except Exception as e:
+            print(f'Classification failed: {e}')
+            return QueryType.STANDALONE
     
     def _condense_question(self, state: State):
         """
-        Takes the chat history and the current question, rewrites the question to be standalone so the vector store can understand it. 
+        Smart routing: classify query type, then process accordingly.
         """
-        chat_history = state.get('chat_history', [])
         question = state['question']
+        chat_history = state.get('chat_history', [])
         
-        # if no chat history exists, return the question as it is 
-        if not chat_history:
+        # filter out welcome message
+        real_history = [m for m in chat_history 
+                    if not (isinstance(m, AIMessage) and "how can I help" in m.content.lower())]
+        
+        if not Config.Chatbot.ENABLE_QUERY_ROUTER:
+             return {"question": question}
+        
+        # classify the query
+        query_type = self._classify_query(question, real_history)
+        print(f"ROUTER: '{question[:50]}...' -> {query_type.value}")
+        
+        # Route based on classification
+        if query_type == QueryType.STANDALONE:
             return {"question": question}
-        condense_system_prompt = (
-            "Given a chat history and the latest user question "
-            "which might reference context in the chat history, "
-            "formulate a standalone question which can be understood "
-            "without the chat history. Do NOT answer the question, "
-            "just reformulate it if needed and otherwise return it as is."
-        )
-        prompt = ChatPromptTemplate.from_messages([
-            ("system", condense_system_prompt),
+        
+        if query_type == QueryType.CHITCHAT:
+            return {"question": question}
+        
+        if query_type in [QueryType.FOLLOWUP, QueryType.CLARIFICATION]:
+            # condense with recent context only
+            recent_history = real_history[-6:]  
+            
+            condense_prompt = ChatPromptTemplate.from_messages([
+    ("system", """You are a query rewriting assistant.
+
+TASK:
+Rewrite the user's latest message into a complete, standalone QUESTION using the chat history.
+
+RULES:
+- Output MUST be a single question ending with a '?'.
+- Do NOT answer the question.
+- Do NOT output explanations, definitions, or extra text—ONLY the rewritten question.
+- Keep it short and specific.
+- If you cannot think of any context related question, just output the EXACT same question asked by the user, nothing else.
+
+GOOD:
+History:
+User: what is the formula of positive definite matrix?
+AI: ...
+User input: and for positive semi definite matrix?
+Output: What is the formula of a positive semidefinite matrix?
+
+BAD:
+Output: A symmetric matrix A is positive semidefinite if x^T A x >= 0 for all x.
+"""),
             MessagesPlaceholder(variable_name='chat_history'),
             ("human", "{question}"),
-        ])
+            ])
+            
+            try:
+                chain = condense_prompt | self.llm | StrOutputParser()
+                reformulated = chain.invoke({
+                    "chat_history": recent_history, 
+                    "question": question
+                }).strip()
+                
+                # clean thinking tags
+                if '</think>' in reformulated:
+                    reformulated = reformulated.split('</think>')[-1].strip()
+                
+                # if the model produced a statement (no '?'), treat it as a search query
+                if not reformulated.endswith('?'):
+                    print(f"CONDENSE: Output '{reformulated}' has no '?', appending one.")
+                    reformulated += "?"
 
-        chain = prompt | self.llm | StrOutputParser()
-        reformulated_question = chain.invoke({
-            "chat_history": chat_history,
-            "question": question
-        })
+                print(f"CONDENSE: '{question}' -> '{reformulated}'")
+                return {"question": reformulated}
+                
+            except Exception as e:
+                print(f"CONDENSE: Failed ({e}), using original")
+                return {"question": question}
         
-        # update the state with the new question
-        return {"question": reformulated_question}
+        return {"question": question}
     
     def _create_workflow(self) -> CompiledStateGraph:
         graph_builder = StateGraph(State)

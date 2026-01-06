@@ -8,14 +8,14 @@ class Config:
 
     class Model:
             NAME = 'qwen3:4b-instruct'
-            TEMPERATURE = 0.6
+            TEMPERATURE = 0.1
 
     class Preprocessing: 
         CHUNK_SIZE = 1024
-        CHUNK_OVERLAP = 128
-        EMBEDDING_MODEL = "BAAI/bge-small-en-v1.5"
-        RERANKER = 'ms-marco-MiniLM-L-12-v2'
-        LLM = 'qwen3:4b-instruct'
+        CHUNK_OVERLAP = 150
+        EMBEDDING_MODEL = "Alibaba-NLP/gte-multilingual-base"
+        RERANKER = 'cross-encoder/ms-marco-MiniLM-L12-v2'
+        # LLM = 'qwen3:4b-instruct'
         CONTEXTUALIZE_CHUNKS = False
         N_SEMANTIC_RESULTS = 6
         N_BM25_RESULTS = 6
@@ -23,6 +23,8 @@ class Config:
     class Chatbot: 
         N_CONTEXT_RESULTS = 4
         GRADING_MODE = False
+        ENABLE_QUERY_ROUTER = True
+        ROUTER_HISTORY_WINDOW = 4
 
     class Path:
         APP_HOME = Path(os.getenv("APP_HOME", Path(__file__).parent.parent))

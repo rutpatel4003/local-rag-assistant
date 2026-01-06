@@ -13,6 +13,10 @@ from config import Config
 from pdf_loader import File
 from langchain_chroma import Chroma
 import hashlib
+import re
+from langchain_huggingface.embeddings import HuggingFaceEmbeddings
+from langchain_community.cross_encoders import HuggingFaceCrossEncoder
+from langchain_classic.retrievers.document_compressors import CrossEncoderReranker
 
 CONTEXT_PROMPT = ChatPromptTemplate.from_template(
     """
@@ -46,31 +50,131 @@ text_splitter = RecursiveCharacterTextSplitter(
     chunk_overlap = Config.Preprocessing.CHUNK_OVERLAP
 )
 
-def create_llm() -> ChatOllama:
-    return ChatOllama(model=Config.Preprocessing.LLM, temperature=0, keep_alive=-1)
+# def create_llm() -> ChatOllama:
+#     return ChatOllama(model=Config.Preprocessing.LLM, temperature=0, keep_alive=-1)
 
-def create_reranker() -> FlashrankRerank:
-    return FlashrankRerank(model = Config.Preprocessing.RERANKER, top_n = Config.Chatbot.N_CONTEXT_RESULTS)
+def create_reranker():
+    """
+    Create a heavy-duty reranker 
+    """
+    model_name = Config.Preprocessing.RERANKER
+    model_kwargs = {'device': 'cuda'} 
+    
+    # Initialize the model
+    model = HuggingFaceCrossEncoder(
+        model_name=model_name,
+        model_kwargs=model_kwargs
+    )
+    
+    return CrossEncoderReranker(model=model, top_n=Config.Chatbot.N_CONTEXT_RESULTS)
 
-def create_embeddings() -> FastEmbedEmbeddings:
-    return FastEmbedEmbeddings(model_name=Config.Preprocessing.EMBEDDING_MODEL)
+def create_embeddings():
+    """
+    Load embedding model for high-quality, long-context embeddings.
+    """
+    model_name = Config.Preprocessing.EMBEDDING_MODEL
+    model_kwargs = {"device": "cuda", 'trust_remote_code': True} # Force GPU
+    encode_kwargs = {"normalize_embeddings": True} # Recommended for BGE models
 
-def _generate_context(llm: ChatOllama, document: str, chunk: str) -> str:
-    messages = CONTEXT_PROMPT.format_messages(document=document, chunk=chunk)
-    response = llm.invoke(messages)
-    return response.content
+    return HuggingFaceEmbeddings(
+        model_name=model_name,
+        model_kwargs=model_kwargs,
+        encode_kwargs=encode_kwargs,
+    )
+
+# def _generate_context(llm: ChatOllama, document: str, chunk: str) -> str:
+#     messages = CONTEXT_PROMPT.format_messages(document=document, chunk=chunk)
+#     response = llm.invoke(messages)
+#     return response.content
+
+def _detect_content_type(text: str) -> str:
+    """
+    Content type detection based on markers
+    """
+    if "[TABLE:" in text and "[/TABLE]" in text:
+        return 'table'
+    if "[FIGURE]" in text and "[/FIGURE]" in text:
+        return 'figure'
+    return 'text'
 
 def _create_chunks(document: Document) -> List[Document]:
-    chunks = text_splitter.split_documents([document])
-    if not Config.Preprocessing.CONTEXTUALIZE_CHUNKS:
+    """
+    Create chunks - tables/figures get surrounding context, text gets split normally.
+    FIXED: Tables/figures include nearby text for better retrieval.
+    """
+    content = document.page_content
+    
+    # Pattern to find tables and figures
+    pattern = r'(\[TABLE:.*?\[/TABLE\]|\[FIGURE\].*?\[/FIGURE\])'
+    
+    # Find all structured content with their positions
+    structured_matches = list(re.finditer(pattern, content, flags=re.DOTALL))
+    
+    if not structured_matches:
+        # No tables/figures - just split normally
+        chunks = text_splitter.create_documents(
+            [content],
+            metadatas=[{**document.metadata, 'content_type': 'text'}]
+        )
         return chunks
-    llm = create_llm()
-    contextual_chunks = []
-    for c in chunks:
-        context = _generate_context(llm, document.page_content, c.page_content)
-        chunk_with_context = f"{context}\n\n{c.page_content}"
-        contextual_chunks.append(Document(page_content=chunk_with_context, metadata=c.metadata))
-    return contextual_chunks
+    
+    final_chunks = []
+    last_end = 0
+    
+    for match in structured_matches:
+        start, end = match.start(), match.end()
+        structured_content = match.group()
+        
+        # Get text BEFORE this table/figure
+        text_before = content[last_end:start].strip()
+        
+        # Get some context AFTER (look ahead up to 500 chars or next structure)
+        context_after_end = min(end + 500, len(content))
+        next_match = re.search(pattern, content[end:context_after_end], flags=re.DOTALL)
+        if next_match:
+            context_after_end = end + next_match.start()
+        text_after = content[end:context_after_end].strip()
+        
+        # Chunk the text before (if substantial)
+        if text_before and len(text_before) > 50:
+            text_chunks = text_splitter.create_documents(
+                [text_before],
+                metadatas=[{**document.metadata, 'content_type': 'text'}]
+            )
+            final_chunks.extend(text_chunks)
+        
+        # Determine content type
+        content_type = 'table' if '[TABLE:' in structured_content else 'figure'
+        
+        # Create chunk for table/figure WITH surrounding context
+        # Include last 200 chars of text_before + table + first 200 chars of text_after
+        context_before = text_before[-200:] if len(text_before) > 200 else text_before
+        context_after_snippet = text_after[:200] if len(text_after) > 200 else text_after
+        
+        chunk_with_context = ""
+        if context_before:
+            chunk_with_context += f"[CONTEXT]\n{context_before}\n[/CONTEXT]\n\n"
+        chunk_with_context += structured_content
+        if context_after_snippet:
+            chunk_with_context += f"\n\n[CONTEXT]\n{context_after_snippet}\n[/CONTEXT]"
+        
+        final_chunks.append(Document(
+            page_content=chunk_with_context,
+            metadata={**document.metadata, 'content_type': content_type}
+        ))
+        
+        last_end = end
+    
+    # Handle remaining text after last table/figure
+    remaining_text = content[last_end:].strip()
+    if remaining_text and len(remaining_text) > 50:
+        text_chunks = text_splitter.create_documents(
+            [remaining_text],
+            metadatas=[{**document.metadata, 'content_type': 'text'}]
+        )
+        final_chunks.extend(text_chunks)
+    
+    return final_chunks
 
 def _calculate_file_hash(content: str) -> str:
     """
@@ -81,9 +185,9 @@ def _calculate_file_hash(content: str) -> str:
 def ingest_files(files: List[File]) -> BaseRetriever:
     """
     Ingests into a Persistent Vector Database (Chroma)
-    Implements 'Incremental Indexing' to skip files that are already indexed
+    Enhanced with table intelligence
     """
-    #initialize embeddings
+    # initialize embeddings
     embedding_model = create_embeddings()
 
     # connect to persistent db on disk
@@ -103,7 +207,11 @@ def ingest_files(files: List[File]) -> BaseRetriever:
                     source_name = m['source']
                     file_hash = m.get('content_hash', None)
                     existing_sources[source_name] = file_hash
-        print(f'Found {len(existing_sources)} files in database')
+        
+        table_count = sum(1 for m in existing_data.get('metadatas', []) 
+                         if m and m.get('content_type') == 'table')
+        
+        print(f'Found {len(existing_sources)} files in database ({table_count} table chunks)')
         print(f'Files: {list(existing_sources.keys())}')
     except Exception as e:
         print(f'Error reading database: {e}')
@@ -115,49 +223,74 @@ def ingest_files(files: List[File]) -> BaseRetriever:
 
     for f in files:
         file_hash = _calculate_file_hash(f.content)
+        
         if f.name in existing_sources:
             stored_hash = existing_sources[f.name]
             if stored_hash == file_hash:
                 print(f'Skipping {f.name} (already indexed)')
+                skipped_files.append(f.name)
                 continue
             else:
                 print(f'File {f.name} content changed - reprocessing')
 
-        # If it is a new file to process
+        # process new file
         print(f"Indexing: {f.name}")
-        doc = Document(f.content, metadata={'source': f.name, 'content_hash': file_hash})
+        doc = Document(
+            f.content, 
+            metadata={
+                'source': f.name, 
+                'content_hash': file_hash
+            }
+        )
+        
         file_chunks = _create_chunks(doc)
+        
+        # add hash to all chunks
         for chunk in file_chunks:
             chunk.metadata['content_hash'] = file_hash
+        
+        # count tables
+        table_chunks = sum(1 for c in file_chunks if c.metadata.get('content_type') == 'table')
+        if table_chunks > 0:
+            print(f"Found {table_chunks} table(s) in {f.name}")
         
         new_chunks.extend(file_chunks)
 
     if skipped_files:
-        print(f'Loaded {len(skipped_files)} from cache.')
+        print(f'Loaded {len(skipped_files)} file(s) from cache')
 
     # add new chunks to the db only
     if new_chunks:
-        print(f'Adding {len(new_chunks)} new chunks to the Vector Database')
+        print(f'Adding {len(new_chunks)} new chunks to Vector Database')
+        
+        # count content types
+        tables = sum(1 for c in new_chunks if c.metadata.get('content_type') == 'table')
+        figures = sum(1 for c in new_chunks if c.metadata.get('content_type') == 'figure')
+        text = len(new_chunks) - tables - figures
+        
+        print(f'{text} text chunks, {tables} tables, {figures} figures')
+        
         vector_store.add_documents(new_chunks)
+    else:
+        print('No new content to index')
 
     # create vector retriever
     semantic_retriever = vector_store.as_retriever(
-        search_kwargs={'k':Config.Preprocessing.N_SEMANTIC_RESULTS}
+        search_kwargs={'k': Config.Preprocessing.N_SEMANTIC_RESULTS}
     )
 
     # create bm25 retriever 
-    all_docs = []
-
     db_state = vector_store.get()
     stored_texts = db_state.get('documents', [])
     stored_metadatas = db_state.get('metadatas', [])
+    
     if not stored_texts:
         raise ValueError('Database is empty! Please upload a document.')
     
     # reconstruct document objects for langchain
     global_corpus = []
     for t, m in zip(stored_texts, stored_metadatas):
-        safe_m = m if m else {} # in case if metadata is none
+        safe_m = m if m else {}
         global_corpus.append(Document(page_content=t, metadata=safe_m))
 
     print(f'Building BM25 Index on {len(global_corpus)} total chunks')
@@ -169,7 +302,7 @@ def ingest_files(files: List[File]) -> BaseRetriever:
         weights=[0.6, 0.4]
     )
 
-    return ContextualCompressionRetriever(base_compressor=create_reranker(), base_retriever=ensemble_retriever)
-
-
-
+    return ContextualCompressionRetriever(
+        base_compressor=create_reranker(), 
+        base_retriever=ensemble_retriever
+    )
