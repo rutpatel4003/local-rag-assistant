@@ -70,11 +70,15 @@ def render_table_from_metadata(table_data: dict):
             if headers and rows:
                 # create DataFrame for better visualization
                 df = pd.DataFrame(rows)
+                if table_data.get('truncated'):
+                    total_rows = table_data.get('num_rows', '?')
+                    shown_rows = table_data.get('rows_shown', len(rows))
+                    st.warning(f"Large table: showing {shown_rows} of {total_rows} rows")
                 
                 # display with nice formatting
                 st.dataframe(
                     df,
-                    width=True,
+                    width='stretch',
                     hide_index=False
                 )
                 
@@ -90,6 +94,7 @@ def render_table_from_metadata(table_data: dict):
                 
                 return True
     except Exception as e:
+        st.error(f"❌ Could not render table: {e}")
         print(f"Error rendering table: {e}")
     
     return False
