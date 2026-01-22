@@ -1,5 +1,5 @@
 from pdf_loader import File
-from data_ingestor import ingest_files
+from data_ingestor import ingest_files, expand_to_parents
 from typing import List, TypedDict, Iterable, Literal
 from enum import Enum
 from config import Config
@@ -75,6 +75,22 @@ FILE_TEMPLATE = """
     <content>{content}</content>
 </file>
 """.strip()
+
+HYDE_PROMPT = ChatPromptTemplate.from_messages([
+    ("system", """You are a technical document author. Given a question, write a short paragraph (3-5 sentences) that would appear in a document answering this question.
+
+RULES:
+- Write as if you are the document, not answering directly
+- Include technical terms and specific details that would appear in the actual document
+- Do NOT say "The document explains..." — just write the content itself
+- Keep it factual and dense with keywords
+
+Example:
+Question: "What is the time complexity of quicksort?"
+Output: "Quicksort has an average-case time complexity of O(n log n) and a worst-case complexity of O(n²). The algorithm uses a divide-and-conquer approach, selecting a pivot element and partitioning the array. Space complexity is O(log n) due to recursive stack frames."
+"""),
+    ("human", "{question}"),
+])
 
 GRADER_SYSTEM_PROMPT = """
 You are a grader assessing relevance of a retrieved document to a user question. 
@@ -175,7 +191,61 @@ class Chatbot:
     def _retrieve(self, state: State):
         print(f"RETRIEVING: {state['question']}")
         context = self.retriever.invoke(state['question'])
+        if Config.Preprocessing.ENABLE_PARENT_CHILD:
+            original_count = len(context)
+            context = expand_to_parents(context)
+            print(f"  Expanded {original_count} children → {len(context)} parents")
+        
         return {"context": context}
+
+    def _hyde_retrieve(self, state: State):
+        """
+        HyDE: Hypothetical Document Embeddings Retrieval
+        1. Generate a hypothetical document that would answer the question
+        2. Embed that hypothetical document
+        3. Retrieve using hypothetical embedding
+        """
+        question = state['question']
+        print(f'HyDE RETRIEVING: {question}')
+
+        try:
+            # generate hypothetical document
+            hyde_chain = HYDE_PROMPT | self.llm | StrOutputParser()
+            hypothetical_doc = hyde_chain.invoke({'question': question})
+            # clean thinking tags if any
+            if '</think>' in hypothetical_doc:
+                hypothetical_doc = hypothetical_doc.split('</think>')[-1].strip()
+            
+            print(f"HyDE generated: {hypothetical_doc[:100]}...")
+
+            # retrieve using hypothetical document as query
+            # the retriever will embed this hypothetical doc and find similar real docs
+            context = self.retriever.invoke(hypothetical_doc)
+            
+            # normal retrieval and merge (optional boost)
+            normal_context = self.retriever.invoke(question)
+            
+            # merge and deduplicate, prioritizing HyDE results
+            seen_content = set()
+            merged = []
+            for doc in context + normal_context:
+                if doc.page_content not in seen_content:
+                    merged.append(doc)
+                    seen_content.add(doc.page_content)
+            if Config.Preprocessing.ENABLE_PARENT_CHILD:
+                merged = expand_to_parents(merged)
+            
+            # limit to configured max
+            merged = merged[:Config.Chatbot.N_CONTEXT_RESULTS * 2]
+            
+            print(f"   HyDE retrieved {len(context)} + normal {len(normal_context)} = {len(merged)} unique docs")
+            
+            return {"context": merged}
+            
+        except Exception as e:
+            print(f"HyDE failed ({e}), falling back to normal retrieval")
+            context = self.retriever.invoke(question)
+            return {"context": context}
     
     def _grade_documents(self, state: State):
         """
@@ -396,15 +466,27 @@ Output: A symmetric matrix A is positive semidefinite if x^T A x >= 0 for all x.
     
     def _create_workflow(self) -> CompiledStateGraph:
         graph_builder = StateGraph(State)
+        retrieve_fn = self._hyde_retrieve if Config.Chatbot.ENABLE_HYDE else self._retrieve
+        
         if not Config.Chatbot.GRADING_MODE:
-            graph_builder.add_sequence([self._condense_question, self._retrieve, self._generate])
+            graph_builder.add_node('_condense_question', self._condense_question)
+            graph_builder.add_node('_retrieve', retrieve_fn)
+            graph_builder.add_node('_generate', self._generate)
+            
             graph_builder.add_edge(START, '_condense_question')
+            graph_builder.add_edge('_condense_question', '_retrieve')
+            graph_builder.add_edge('_retrieve', '_generate')
             graph_builder.add_edge('_generate', END)
         else:
-            graph_builder.add_sequence([self._condense_question, self._retrieve, self._grade_documents])
+            graph_builder.add_node('_condense_question', self._condense_question)
+            graph_builder.add_node('_retrieve', retrieve_fn)
+            graph_builder.add_node('_grade_documents', self._grade_documents)
             graph_builder.add_node('_transform_query', self._transform_query)
             graph_builder.add_node('_generate', self._generate)
+            
             graph_builder.add_edge(START, '_condense_question')
+            graph_builder.add_edge('_condense_question', '_retrieve')
+            graph_builder.add_edge('_retrieve', '_grade_documents')
             graph_builder.add_conditional_edges(
                 '_grade_documents', self._decide_to_generate,
                 {
@@ -414,6 +496,7 @@ Output: A symmetric matrix A is positive semidefinite if x^T A x >= 0 for all x.
             )
             graph_builder.add_edge('_transform_query', '_retrieve')
             graph_builder.add_edge('_generate', END)
+        
         return graph_builder.compile()
 
     def _ask_model(
