@@ -116,10 +116,6 @@ class ContentBlock:
 def extract_pdf_content_with_structure(data: bytes, use_got_ocr: bool = True) -> List[ContentBlock]:
     """
     Extract content from PDF with structure detection.
-
-    Fixes:
-    - Keeps tables in reading order (by bbox), instead of appending all tables first.
-    - Attaches nearby captions like "Table 3.1: ..." to the table block.
     """
     with fitz.open(stream=data, filetype="pdf") as doc:
         all_blocks: List[ContentBlock] = []
@@ -130,12 +126,12 @@ def extract_pdf_content_with_structure(data: bytes, use_got_ocr: bool = True) ->
         for page_num, page in enumerate(doc):
             print(f"Processing page {page_num + 1}/{len(doc)}...")
 
-            # One pass: get layout blocks in reading order
+            # one pass: get layout blocks in reading order
             layout_blocks = page.get_text("dict", sort=True).get("blocks", [])
 
             page_blocks: List[ContentBlock] = []
 
-            # --- Native tables (PyMuPDF) ---
+            # native tables 
             found_tables = page.find_tables()
             table_bboxes: List[tuple] = []
 
@@ -143,6 +139,10 @@ def extract_pdf_content_with_structure(data: bytes, use_got_ocr: bool = True) ->
                 header = table.header.names
                 if not header:
                     header = [f"Col {i+1}" for i in range(table.col_count)]
+                else:
+                    # convert None values to strings
+                    header = [str(h) if h is not None else f"Col {i+1}"
+                              for i, h in enumerate(header)]
 
                 rows = []
                 for row_data in table.extract():
@@ -152,13 +152,13 @@ def extract_pdf_content_with_structure(data: bytes, use_got_ocr: bool = True) ->
                     if len(cleaned_row) == len(header):
                         rows.append(dict(zip(header, cleaned_row)))
 
-                # Markdown representation
+                # markdown representation
                 markdown_lines = [
                     "| " + " | ".join(header) + " |",
                     "| " + " | ".join(["---"] * len(header)) + " |",
                 ]
                 for row in rows:
-                    row_values = [row.get(h, "") for h in header]
+                    row_values = [str(row.get(h, "")) for h in header]
                     markdown_lines.append("| " + " | ".join(row_values) + " |")
                 raw_markdown = "\n".join(markdown_lines)
 
@@ -192,11 +192,10 @@ def extract_pdf_content_with_structure(data: bytes, use_got_ocr: bool = True) ->
                         return True
                 return False
 
-            # --- Text + image blocks (OCR for image blocks) ---
+            # Text + image blocks (OCR for image blocks) 
             for block in layout_blocks:
                 bbox = tuple(block.get("bbox", (0, 0, 0, 0)))
 
-                # Don't double-read table text
                 if _overlaps_table(bbox):
                     continue
 
@@ -295,7 +294,7 @@ def extract_pdf_content_with_structure(data: bytes, use_got_ocr: bool = True) ->
 
             page_blocks = [b for b in page_blocks if id(b) not in caption_block_ids_to_drop]
 
-            # --- Keep reading order ---
+            # keep reading order 
             def _sort_key(b: ContentBlock):
                 if b.bbox:
                     x0, y0, x1, y1 = b.bbox
