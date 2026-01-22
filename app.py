@@ -7,6 +7,7 @@ from pdf_loader import load_uploaded_file, cleanup_got_model
 import time
 import pandas as pd
 import json
+from chatbot import ConfidenceEvent  
 
 LOADING_MESSAGES = [
     "Hold on, I'm wrestling with some digital hamsters... literally.",
@@ -222,10 +223,11 @@ if prompt := st.chat_input("Ask about your documents (including tables)..."):
         # Create layout
         status_placeholder = st.empty()
         
-        metrics_cols = st.columns(3)
+        metrics_cols = st.columns(4)
         retrieval_time_metric = metrics_cols[0].empty()
         docs_retrieved_metric = metrics_cols[1].empty()
         docs_relevant_metric = metrics_cols[2].empty()
+        confidence_metric = metrics_cols[3].empty()
         
         # Sources section
         st.markdown("---")
@@ -245,8 +247,12 @@ if prompt := st.chat_input("Ask about your documents (including tables)..."):
         num_sources = 0
         
         for event in chatbot.ask(prompt, st.session_state.messages):
+            if isinstance(event, ConfidenceEvent):
+                label = event.content.get("label", "unknown").title()
+                score = event.content.get("score", 0.0)
+                confidence_metric.metric("Confidence", f"{label} ({score:.2f})")
             if isinstance(event, SourcesEvent):
-                # Update metrics
+                # update metrics
                 retrieval_time = time.time() - start_time
                 retrieval_time_metric.metric("Retrieval", f"{retrieval_time:.2f}s")
                 docs_retrieved_metric.metric("Retrieved", len(event.content))
@@ -257,7 +263,7 @@ if prompt := st.chat_input("Ask about your documents (including tables)..."):
                 if not sources_shown and event.content:
                     sources_shown = True
                     
-                    # Count content types
+                    # count content types
                     tables = sum(1 for d in event.content if d.metadata.get('content_type') == 'table')
                     figures = sum(1 for d in event.content if d.metadata.get('content_type') == 'figure')
                     
@@ -268,7 +274,7 @@ if prompt := st.chat_input("Ask about your documents (including tables)..."):
                     sources_header.markdown(header_text)
                     
                     with sources_container:
-                        # Use tabs if many sources, expanders if few
+                        # use tabs if many sources, expanders if few
                         if len(event.content) <= 3:
                             for i, doc in enumerate(event.content):
                                 render_source_content(doc, i)
