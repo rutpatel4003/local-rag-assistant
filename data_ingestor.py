@@ -13,10 +13,76 @@ from config import Config
 from pdf_loader import File
 from langchain_chroma import Chroma
 import hashlib
+import json
 import re
 from langchain_huggingface.embeddings import HuggingFaceEmbeddings
 from langchain_community.cross_encoders import HuggingFaceCrossEncoder
 from langchain_classic.retrievers.document_compressors import CrossEncoderReranker
+
+def reciprocal_rank_fusion(
+    results_lists: List[List[Document]],
+    k: int = 60
+) -> List[Document]:
+    """
+    Reciprocal Rank Fusion (RRF) - fuses multiple ranked lists.
+    Where:
+        - d = document
+        - r = retriever (e.g., semantic, BM25)
+        - rank_r(d) = rank of document d in retriever r's results
+        - k = constant (typically 60)
+    """
+    doc_scores: dict[str, float] = {}
+    doc_objects: dict[str, Document] = {}
+    
+    # score each document across all result lists
+    for retriever_idx, results in enumerate(results_lists):
+        for rank, doc in enumerate(results):
+            # use content hash as unique ID (handles same doc from multiple retrievers)
+            doc_id = hashlib.md5(doc.page_content.encode()).hexdigest()
+            rrf_score = 1.0 / (k + rank + 1)
+            
+            # accumulate scores if doc appears in multiple result lists
+            if doc_id in doc_scores:
+                doc_scores[doc_id] += rrf_score
+            else:
+                doc_scores[doc_id] = rrf_score
+                doc_objects[doc_id] = doc
+
+    # return documents in fused rank order
+    sorted_doc_ids = sorted(
+        doc_scores.keys(),
+        key=lambda x: doc_scores[x],
+        reverse=True
+    )
+    # return documents in fused rank order
+    fused_docs = [doc_objects[doc_id] for doc_id in sorted_doc_ids]
+    if fused_docs:
+        top_score = doc_scores[sorted_doc_ids[0]]
+        print(f" RRF: Fused {len(fused_docs)} unique docs, top score: {top_score:.3f}")
+    
+    return fused_docs
+
+class RRFRetriever(BaseRetriever):
+    """
+    Custom retriever that uses Reciprocal Rank Fusion.
+    """
+    retrievers: List[BaseRetriever]
+    k: int = 60
+    
+    def _get_relevant_documents(self, query: str) -> List[Document]:
+        """
+        Invoke all retrievers and fuse results with RRF
+        """
+        # get results from each retriever
+        results_lists = []
+        for retriever in self.retrievers:
+            results = retriever.invoke(query)
+            results_lists.append(results)
+        
+        # fuse with RRF
+        fused = reciprocal_rank_fusion(results_lists, k=self.k)
+        return fused
+
 
 CONTEXT_PROMPT = ChatPromptTemplate.from_template(
     """
@@ -55,12 +121,15 @@ text_splitter = RecursiveCharacterTextSplitter(
 
 def create_reranker():
     """
-    Create a heavy-duty reranker 
+    Create a cross-encoder reranker with auto device detection.
     """
     model_name = Config.Preprocessing.RERANKER
-    model_kwargs = {'device': 'cuda'} 
+    device = Config.DEVICE
     
-    # Initialize the model
+    print(f"Loading reranker on device: {device}")
+    
+    model_kwargs = {'device': device}
+    
     model = HuggingFaceCrossEncoder(
         model_name=model_name,
         model_kwargs=model_kwargs
@@ -70,11 +139,19 @@ def create_reranker():
 
 def create_embeddings():
     """
-    Load embedding model for high-quality, long-context embeddings.
+    Load embedding model with auto device detection.
+    Works on both GPU (fast) and CPU (portable).
     """
     model_name = Config.Preprocessing.EMBEDDING_MODEL
-    model_kwargs = {"device": "cuda", 'trust_remote_code': True} # Force GPU
-    encode_kwargs = {"normalize_embeddings": True} # Recommended for BGE models
+    device = Config.DEVICE
+    
+    print(f"Loading embeddings on device: {device}")
+    
+    model_kwargs = {
+        "device": device,
+        "trust_remote_code": True,
+    }
+    encode_kwargs = {"normalize_embeddings": True}
 
     return HuggingFaceEmbeddings(
         model_name=model_name,
@@ -104,14 +181,14 @@ def _create_chunks(document: Document) -> List[Document]:
     """
     content = document.page_content
     
-    # Pattern to find tables and figures
+    # pattern to find tables and figures
     pattern = r'(\[TABLE:.*?\[/TABLE\]|\[FIGURE\].*?\[/FIGURE\])'
     
-    # Find all structured content with their positions
+    # find all structured content with their positions
     structured_matches = list(re.finditer(pattern, content, flags=re.DOTALL))
     
     if not structured_matches:
-        # No tables/figures - just split normally
+        # no tables/figures - just split normally
         chunks = text_splitter.create_documents(
             [content],
             metadatas=[{**document.metadata, 'content_type': 'text'}]
@@ -125,17 +202,17 @@ def _create_chunks(document: Document) -> List[Document]:
         start, end = match.start(), match.end()
         structured_content = match.group()
         
-        # Get text BEFORE this table/figure
+        # get text BEFORE this table/figure
         text_before = content[last_end:start].strip()
         
-        # Get some context AFTER (look ahead up to 500 chars or next structure)
+        # get some context AFTER (look ahead up to 500 chars or next structure)
         context_after_end = min(end + 500, len(content))
         next_match = re.search(pattern, content[end:context_after_end], flags=re.DOTALL)
         if next_match:
             context_after_end = end + next_match.start()
         text_after = content[end:context_after_end].strip()
         
-        # Chunk the text before (if substantial)
+        # chunk the text before (if substantial)
         if text_before and len(text_before) > 50:
             text_chunks = text_splitter.create_documents(
                 [text_before],
@@ -143,11 +220,11 @@ def _create_chunks(document: Document) -> List[Document]:
             )
             final_chunks.extend(text_chunks)
         
-        # Determine content type
+        # determine content type
         content_type = 'table' if '[TABLE:' in structured_content else 'figure'
         
-        # Create chunk for table/figure WITH surrounding context
-        # Include last 200 chars of text_before + table + first 200 chars of text_after
+        # create chunk for table/figure WITH surrounding context
+        # include last 200 chars of text_before + table + first 200 chars of text_after
         context_before = text_before[-200:] if len(text_before) > 200 else text_before
         context_after_snippet = text_after[:200] if len(text_after) > 200 else text_after
         
@@ -165,7 +242,7 @@ def _create_chunks(document: Document) -> List[Document]:
         
         last_end = end
     
-    # Handle remaining text after last table/figure
+    # handle remaining text after last table/figure
     remaining_text = content[last_end:].strip()
     if remaining_text and len(remaining_text) > 50:
         text_chunks = text_splitter.create_documents(
@@ -181,6 +258,390 @@ def _calculate_file_hash(content: str) -> str:
     Calculate hash of file content for deduplication
     """
     return hashlib.md5(content.encode('utf-8')).hexdigest()
+
+def _delete_chunks_by_source(vector_store: Chroma, source_name: str):
+    """
+    Delete all chunks from Chroma that belong to a specific source file.
+    Called when a file's content hash has changed (needs re-indexing).
+    """
+    try:
+        results = vector_store.get(where={"source": source_name})
+        ids_to_delete = results.get('ids', [])
+        
+        if ids_to_delete:
+            vector_store.delete(ids=ids_to_delete)
+            print(f"Deleted {len(ids_to_delete)} stale chunks for '{source_name}'")
+    except Exception as e:
+        print(f"Warning: Could not delete old chunks for {source_name}: {e}")
+
+def _create_chunks_from_blocks(file: File, file_hash: str) -> List[Document]:
+    """
+    Create chunks from structured ContentBlocks, preserving page/type metadata.
+    Falls back to text-based chunking if no blocks available.
+    """
+    # fallback: if no content_blocks, use old text-based approach
+    if not file.content_blocks:
+        doc = Document(
+            file.content, 
+            metadata={'source': file.name, 'content_hash': file_hash}
+        )
+        return _create_chunks(doc)
+    
+    chunks = []
+    
+    for block in file.content_blocks:
+        base_metadata = {
+            'source': file.name,
+            'content_hash': file_hash,
+            'page': block.page_num,
+            'content_type': block.content_type,
+        }
+        
+                # keep as single chunk with table_data 
+        if block.content_type == 'table':
+            # serialize table_data to JSON string 
+            table_data_json = None
+            if block.table_data:
+                table_dict = block.table_data.to_dict()
+                table_data_json = json.dumps(table_dict)
+                MAX_TABLE_DATA_SIZE = 30000 
+                if len(table_data_json) > MAX_TABLE_DATA_SIZE:
+                    print(f"Table too large ({len(table_data_json)} bytes), truncating rows...")
+                    # keep headers + first N rows that fit
+                    truncated_dict = {
+                        'headers': table_dict['headers'],
+                        'rows': [],
+                        'raw_markdown': table_dict.get('raw_markdown', '')[:5000],  # truncate markdown too
+                        'num_rows': table_dict['num_rows'],
+                        'num_cols': table_dict['num_cols'],
+                        'truncated': True,  # flag for UI
+                    }
+                    for row in table_dict['rows']:
+                        test_json = json.dumps(truncated_dict)
+                        if len(test_json) < MAX_TABLE_DATA_SIZE - 1000:
+                            truncated_dict['rows'].append(row)
+                        else:
+                            break
+                    truncated_dict['rows_shown'] = len(truncated_dict['rows'])
+                    table_data_json = json.dumps(truncated_dict)
+            
+            # format table content with markers (keeps compatibility with _create_chunks)
+            content = f"[TABLE:]\n{block.content}\n"
+            if block.table_data:
+                content += f"\n{block.table_data.to_searchable_text()}\n"
+            content += "[/TABLE]"
+            
+            chunks.append(Document(
+                page_content=content,
+                metadata={
+                    **base_metadata,
+                    'table_data': table_data_json,
+                }
+            ))
+        
+        # FIGURES: keep as single chunk 
+        elif block.content_type == 'figure':
+            content = f"[FIGURE]\n{block.content}\n[/FIGURE]"
+            chunks.append(Document(
+                page_content=content,
+                metadata=base_metadata,
+            ))
+        
+        # TEXT: split if large 
+        else:
+            text = block.content.strip()
+            if not text:
+                continue
+            
+            if len(text) <= Config.Preprocessing.CHUNK_SIZE:
+                chunks.append(Document(
+                    page_content=text,
+                    metadata=base_metadata,
+                ))
+            else:
+                # split large text blocks, each sub-chunk keeps the same page
+                sub_chunks = text_splitter.create_documents(
+                    [text],
+                    metadatas=[base_metadata]
+                )
+                chunks.extend(sub_chunks)
+    
+    return chunks
+
+def _create_parent_child_chunks(file: File, file_hash: str) -> tuple[List[Document], List[Document]]:
+    """
+    Create parent-child chunk pairs for improved retrieval.
+    """
+    import uuid
+    
+    parent_splitter = RecursiveCharacterTextSplitter(
+        chunk_size=Config.Preprocessing.PARENT_CHUNK_SIZE,
+        chunk_overlap=200
+    )
+    child_splitter = RecursiveCharacterTextSplitter(
+        chunk_size=Config.Preprocessing.CHILD_CHUNK_SIZE,
+        chunk_overlap=50
+    )
+    
+    parent_chunks = []
+    child_chunks = []
+    
+    # create parent chunks from content blocks
+    if not file.content_blocks:
+        # fallback: use raw content
+        parent_docs = parent_splitter.create_documents(
+            [file.content],
+            metadatas=[{'source': file.name, 'content_hash': file_hash, 'content_type': 'text'}]
+        )
+    else:
+        parent_docs = []
+        for block in file.content_blocks:
+            base_meta = {
+                'source': file.name,
+                'content_hash': file_hash,
+                'page': block.page_num,
+                'content_type': block.content_type,
+            }
+            
+            # tables/figures stay as single parent 
+            if block.content_type in ('table', 'figure'):
+                content = block.content
+                if block.content_type == 'table':
+                    content = f"[TABLE:]\n{content}\n[/TABLE]"
+                    if block.table_data:
+                        base_meta['table_data'] = json.dumps(block.table_data.to_dict())[:30000]
+                else:
+                    content = f"[FIGURE]\n{content}\n[/FIGURE]"
+                
+                parent_docs.append(Document(page_content=content, metadata=base_meta))
+            else:
+                # Text blocks get split into parents
+                if len(block.content) > Config.Preprocessing.PARENT_CHUNK_SIZE:
+                    splits = parent_splitter.create_documents(
+                        [block.content],
+                        metadatas=[base_meta]
+                    )
+                    parent_docs.extend(splits)
+                elif block.content.strip():
+                    parent_docs.append(Document(page_content=block.content, metadata=base_meta))
+    
+    # create children from each parent
+    for parent in parent_docs:
+        parent_id = str(uuid.uuid4())[:8]
+        parent.metadata['parent_id'] = parent_id
+        parent.metadata['is_parent'] = True
+        parent_chunks.append(parent)
+        
+        # tables/figures: child = parent (don't split further)
+        if parent.metadata.get('content_type') in ('table', 'figure'):
+            child = Document(
+                page_content=parent.page_content,
+                metadata={
+                    **parent.metadata,
+                    'parent_id': parent_id,
+                    'is_parent': False,
+                }
+            )
+            child_chunks.append(child)
+        else:
+            # text: split into smaller children
+            if len(parent.page_content) > Config.Preprocessing.CHILD_CHUNK_SIZE:
+                children = child_splitter.create_documents(
+                    [parent.page_content],
+                    metadatas=[{
+                        **parent.metadata,
+                        'parent_id': parent_id,
+                        'is_parent': False,
+                    }]
+                )
+                child_chunks.extend(children)
+            else:
+                child_chunks.append(Document(
+                    page_content=parent.page_content,
+                    metadata={
+                        **parent.metadata,
+                        'parent_id': parent_id,
+                        'is_parent': False,
+                    }
+                ))
+    
+    return child_chunks, parent_chunks
+
+
+# global parent store (maps parent_id -> parent Document)
+_parent_store: dict[str, Document] = {}
+
+
+def _build_parent_store(parent_chunks: List[Document]):
+    """Store parents in memory for lookup during retrieval"""
+    global _parent_store
+    for parent in parent_chunks:
+        pid = parent.metadata.get('parent_id')
+        if pid:
+            _parent_store[pid] = parent
+
+
+def _rebuild_parent_store_from_chroma(vector_store: Chroma):
+    """
+    Rebuild parent store from Chroma on startup.
+    Called when loading existing indexed files.
+    """
+    global _parent_store
+
+    try:
+        # Get all parent documents from Chroma
+        results = vector_store.get(where={"is_parent": True})
+
+        if results and results.get('documents'):
+            docs = results['documents']
+            metadatas = results.get('metadatas', [])
+
+            for doc_text, meta in zip(docs, metadatas):
+                if meta and meta.get('parent_id'):
+                    parent_doc = Document(page_content=doc_text, metadata=meta)
+                    _parent_store[meta['parent_id']] = parent_doc
+
+            print(f"Rebuilt parent store: {len(_parent_store)} parents loaded")
+    except Exception as e:
+        print(f"Warning: Could not rebuild parent store: {e}")
+
+
+def expand_to_parents(child_docs: List[Document]) -> List[Document]:
+    """
+    Given retrieved child documents, expand to their parent documents.
+    Deduplicates by parent_id.
+    """
+    global _parent_store
+
+    seen_parents = set()
+    expanded = []
+
+    for child in child_docs:
+        parent_id = child.metadata.get('parent_id')
+
+        if parent_id and parent_id not in seen_parents:
+            parent = _parent_store.get(parent_id)
+            if parent:
+                expanded.append(parent)
+                seen_parents.add(parent_id)
+            else:
+                # parent not found, use child as-is
+                expanded.append(child)
+                seen_parents.add(parent_id)
+        elif not parent_id:
+            # no parent_id, use as-is
+            expanded.append(child)
+
+    return expanded
+
+
+class ParentChildRetriever(BaseRetriever):
+    """
+    Custom retriever that retrieves children then expands to parents.
+    """
+    child_retriever: BaseRetriever
+
+    model_config = {"arbitrary_types_allowed": True}
+
+    def _get_relevant_documents(self, query: str, **kwargs) -> List[Document]:
+        """Retrieve children, expand to parents"""
+        from config import Config as AppConfig
+
+        # Get children
+        children = self.child_retriever.invoke(query)
+
+        # Expand to parents
+        if AppConfig.Preprocessing.ENABLE_PARENT_CHILD and _parent_store:
+            parents = expand_to_parents(children)
+            print(f"  Expanded {len(children)} children → {len(parents)} parents")
+            return parents
+
+        return children
+
+    async def _aget_relevant_documents(self, query: str, **kwargs) -> List[Document]:
+        """Async version"""
+        return self._get_relevant_documents(query, **kwargs)
+
+
+class MultiQueryRetriever(BaseRetriever):
+    """
+    Generates multiple query variations and retrieves with all of them.
+    Lighter and faster than HyDE, better for cross-domain retrieval.
+    """
+    base_retriever: BaseRetriever
+    llm: any = None
+
+    model_config = {"arbitrary_types_allowed": True}
+
+    def _generate_queries(self, original_query: str) -> List[str]:
+        """Generate 2-3 query variations using LLM"""
+        from langchain_ollama import ChatOllama
+        from langchain_core.output_parsers import StrOutputParser
+        from langchain_core.prompts import ChatPromptTemplate
+
+        if self.llm is None:
+            self.llm = ChatOllama(
+                model=Config.Model.NAME,
+                temperature=0.3,
+                num_ctx=1024,
+                num_predict=150,
+                keep_alive=0,
+            )
+
+        prompt = ChatPromptTemplate.from_template(
+            """Generate 2 alternative versions of this question for better search.
+Keep the same meaning but use different words/phrasing.
+Output ONLY the 2 alternatives, one per line. No numbering, no explanations.
+
+Original: {query}
+
+Alternatives:"""
+        )
+
+        try:
+            chain = prompt | self.llm | StrOutputParser()
+            result = chain.invoke({'query': original_query})
+
+            # Clean thinking tags
+            if '</think>' in result:
+                result = result.split('</think>')[-1].strip()
+
+            # Parse alternatives
+            alternatives = [q.strip() for q in result.strip().split('\n') if q.strip()]
+            alternatives = [q for q in alternatives if len(q) > 10][:2]  # Max 2
+
+            return [original_query] + alternatives
+
+        except Exception as e:
+            print(f"  Query expansion failed: {e}")
+            return [original_query]
+
+    def _get_relevant_documents(self, query: str, **kwargs) -> List[Document]:
+        """Retrieve with multiple query variations"""
+        from config import Config as AppConfig
+
+        if not AppConfig.Chatbot.ENABLE_MULTI_QUERY:
+            return self.base_retriever.invoke(query)
+
+        queries = self._generate_queries(query)
+        print(f"  Multi-query: {len(queries)} variations")
+
+        # Retrieve with all queries
+        all_docs = []
+        seen_content = set()
+
+        for q in queries:
+            docs = self.base_retriever.invoke(q)
+            for doc in docs:
+                content_hash = hash(doc.page_content[:200])
+                if content_hash not in seen_content:
+                    all_docs.append(doc)
+                    seen_content.add(content_hash)
+
+        return all_docs
+
+    async def _aget_relevant_documents(self, query: str, **kwargs) -> List[Document]:
+        return self._get_relevant_documents(query, **kwargs)
 
 def ingest_files(files: List[File]) -> BaseRetriever:
     """
@@ -217,7 +678,7 @@ def ingest_files(files: List[File]) -> BaseRetriever:
         print(f'Error reading database: {e}')
         existing_sources = {}
 
-    # filter new files only
+        # filter new files only
     new_chunks = []
     skipped_files = []
 
@@ -231,33 +692,35 @@ def ingest_files(files: List[File]) -> BaseRetriever:
                 skipped_files.append(f.name)
                 continue
             else:
-                print(f'File {f.name} content changed - reprocessing')
+                print(f'File {f.name} content changed - deleting old chunks and reprocessing')
+                _delete_chunks_by_source(vector_store, f.name)
 
         # process new file
         print(f"Indexing: {f.name}")
-        doc = Document(
-            f.content, 
-            metadata={
-                'source': f.name, 
-                'content_hash': file_hash
-            }
-        )
-        
-        file_chunks = _create_chunks(doc)
-        
-        # add hash to all chunks
-        for chunk in file_chunks:
-            chunk.metadata['content_hash'] = file_hash
-        
+
+        # use parent-child chunking if enabled
+        if Config.Preprocessing.ENABLE_PARENT_CHILD:
+            child_chunks, parent_chunks = _create_parent_child_chunks(f, file_hash)
+            _build_parent_store(parent_chunks)
+            # Store BOTH children and parents in Chroma
+            # Children are used for retrieval, parents for expansion
+            file_chunks = child_chunks + parent_chunks
+            print(f"  Created {len(child_chunks)} children, {len(parent_chunks)} parents")
+        else:
+            file_chunks = _create_chunks_from_blocks(f, file_hash)
+
         # count tables
         table_chunks = sum(1 for c in file_chunks if c.metadata.get('content_type') == 'table')
         if table_chunks > 0:
-            print(f"Found {table_chunks} table(s) in {f.name}")
-        
+            print(f"  Found {table_chunks} table(s) in {f.name}")
+
         new_chunks.extend(file_chunks)
 
     if skipped_files:
         print(f'Loaded {len(skipped_files)} file(s) from cache')
+        # Rebuild parent store from Chroma for cached files
+        if Config.Preprocessing.ENABLE_PARENT_CHILD:
+            _rebuild_parent_store_from_chroma(vector_store)
 
     # add new chunks to the db only
     if new_chunks:
@@ -274,35 +737,62 @@ def ingest_files(files: List[File]) -> BaseRetriever:
     else:
         print('No new content to index')
 
-    # create vector retriever
-    semantic_retriever = vector_store.as_retriever(
-        search_kwargs={'k': Config.Preprocessing.N_SEMANTIC_RESULTS}
-    )
+    # create vector retriever (children only if parent-child enabled)
+    if Config.Preprocessing.ENABLE_PARENT_CHILD:
+        # Only retrieve children, not parents
+        semantic_retriever = vector_store.as_retriever(
+            search_kwargs={
+                'k': Config.Preprocessing.N_SEMANTIC_RESULTS,
+                'filter': {'is_parent': False}
+            }
+        )
+    else:
+        semantic_retriever = vector_store.as_retriever(
+            search_kwargs={'k': Config.Preprocessing.N_SEMANTIC_RESULTS}
+        )
 
-    # create bm25 retriever 
+    # create bm25 retriever
     db_state = vector_store.get()
     stored_texts = db_state.get('documents', [])
     stored_metadatas = db_state.get('metadatas', [])
-    
+
     if not stored_texts:
         raise ValueError('Database is empty! Please upload a document.')
-    
-    # reconstruct document objects for langchain
+
+    # reconstruct document objects for BM25 (children only if parent-child enabled)
     global_corpus = []
     for t, m in zip(stored_texts, stored_metadatas):
         safe_m = m if m else {}
+        # Skip parents for BM25 - we only want to retrieve children
+        if Config.Preprocessing.ENABLE_PARENT_CHILD and safe_m.get('is_parent'):
+            continue
         global_corpus.append(Document(page_content=t, metadata=safe_m))
 
-    print(f'Building BM25 Index on {len(global_corpus)} total chunks')
+    print(f'Building BM25 Index on {len(global_corpus)} chunks (children only)')
     bm25_retriever = BM25Retriever.from_documents(global_corpus)
     bm25_retriever.k = Config.Preprocessing.N_BM25_RESULTS
-
-    ensemble_retriever = EnsembleRetriever(
-        retrievers=[semantic_retriever, bm25_retriever],
-        weights=[0.6, 0.4]
-    )
-
+    if Config.Preprocessing.USE_RRF:
+        print("Using Reciprocal Rank Fusion (RRF) for ensemble")
+        ensemble_retriever = RRFRetriever(
+            retrievers=[semantic_retriever, bm25_retriever],
+            k=Config.Preprocessing.RRF_K
+        )
+    else:
+        print("Using weighted average for ensemble")
+        ensemble_retriever = EnsembleRetriever(
+            retrievers=[semantic_retriever, bm25_retriever],
+            weights=[0.6, 0.4]
+        )
+    if Config.Preprocessing.ENABLE_PARENT_CHILD:
+        parent_child_retriever = ParentChildRetriever(child_retriever=ensemble_retriever)
+        final_retriever = parent_child_retriever
+    else:
+        final_retriever = ensemble_retriever
+    reranker = create_reranker()
+    if reranker is None:
+        return final_retriever
+    
     return ContextualCompressionRetriever(
-        base_compressor=create_reranker(), 
-        base_retriever=ensemble_retriever
+        base_compressor=reranker,
+        base_retriever=final_retriever
     )
