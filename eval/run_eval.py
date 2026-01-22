@@ -43,9 +43,10 @@ class HyDERetriever(BaseRetriever):
             self.llm = ChatOllama(
                 model=Config.Model.NAME,
                 temperature=0,
-                num_ctx=2048,
+                num_ctx=4096,
                 num_predict=256,
-                keep_alive=0,  # Unload model after each call to save VRAM
+                keep_alive=-1,  # Unload model after each call to save 
+                reasoning=True,
             )
 
     def _get_relevant_documents(self, query: str, **kwargs) -> List[Document]:
@@ -145,11 +146,13 @@ def main():
     if args.multi_query:
         use_multi_query = True
 
-    if use_multi_query and not use_hyde:  # Don't stack with HyDE
+    # Multi-query can run independently or with HyDE
+    # Note: When both enabled, multi-query generates variations, HyDE processes each variation
+    if use_multi_query:
         print("🔄 Multi-Query enabled - generating query variations")
         from data_ingestor import MultiQueryRetriever
         retriever = MultiQueryRetriever(base_retriever=retriever)
-    elif not use_multi_query:
+    else:
         print("📊 Multi-Query disabled")
 
     # Print config summary

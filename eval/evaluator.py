@@ -2,9 +2,11 @@ import json
 import time
 from pathlib import Path
 from dataclasses import dataclass, field
-from typing import List, Dict, Optional, Any
+from typing import List, Dict, Optional, Any, Tuple
 from datetime import datetime
 from langchain_core.documents import Document
+
+from chatbot import Role
 
 @dataclass
 class RetrievalResult:
@@ -193,6 +195,192 @@ class Evaluator:
             table_hit_rate=sum(r.hit for r in table_results) / len(table_results) if table_results else 0.0,
             text_hit_rate=sum(r.hit for r in text_results) / len(text_results) if text_results else 0.0,
         )
+
+    def evaluate_with_faithfulness(
+        self,
+        chatbot,  
+        verbose: bool = False
+        ) -> Tuple[List[dict], dict]:
+        """
+        Complete evaluation: retrieval + generation + faithfulness.
+        
+        Measures:
+        1. Retrieval quality (Recall@k, MRR, Hit Rate)
+        2. Answer faithfulness (LLM-as-Judge)
+        3. End-to-end latency
+        """
+        from eval.llm_judge import LLMJudge
+        from chatbot import SourcesEvent, FinalAnswerEvent, ChunkEvent, Message
+        from config import Config
+        import time
+        
+        gold_set = self.load_gold_set()
+        judge = LLMJudge(
+            model_name=Config.Eval.JUDGE_MODEL,
+            verbose=verbose
+        )
+        
+        detailed_results = []
+        
+        print(f"\n{'='*60}")
+        print(f"FULL RAG EVALUATION")
+        print(f"Questions: {len(gold_set)}")
+        print(f"Retrieval k: {self.config.k}")
+        print(f"Judge model: {Config.Eval.JUDGE_MODEL}")
+        print(f"{'='*60}\n")
+        
+        for i, gold_item in enumerate(gold_set):
+            question = gold_item['question']
+            print(f"[{i+1}/{len(gold_set)}] {question[:60]}...")
+            
+            # collect events from chatbot
+            context_docs = []
+            answer_chunks = []
+            start_time = time.perf_counter()
+            
+            try:
+                for event in chatbot.ask(question, [Message(role=Role.USER, content="")]):
+                    if isinstance(event, SourcesEvent):
+                        context_docs = event.content
+                    elif isinstance(event, ChunkEvent):
+                        answer_chunks.append(event.content)
+                    elif isinstance(event, FinalAnswerEvent):
+                        # some systems emit final answer event
+                        pass
+                
+                answer = "".join(answer_chunks).strip()
+                latency_ms = (time.perf_counter() - start_time) * 1000
+                
+                # retrieval metrics
+                hit = self._check_hit(context_docs[:self.config.k], gold_item)
+                recall = self._compute_recall_at_k(context_docs, gold_item, self.config.k)
+                rr = self._compute_reciprocal_rank(context_docs, gold_item)
+                
+                # faithfulness evaluation
+                if answer and len(answer) > 10:  # only judge substantial answers
+                    judgment = judge.evaluate(question, context_docs, answer)
+                    
+                    result = {
+                        "question": question,
+                        "question_id": gold_item.get('id', f"q{i+1}"),
+                        "answer": answer,
+                        "answer_length": len(answer),
+                        
+                        # retrieval metrics
+                        "retrieval_hit": hit,
+                        "recall_at_k": recall,
+                        "reciprocal_rank": rr,
+                        "num_sources": len(context_docs),
+                        
+                        # faithfulness metrics
+                        "faithfulness": judgment.faithfulness_score,
+                        "relevance": judgment.relevance_score,
+                        "completeness": judgment.completeness_score,
+                        "overall_quality": judgment.overall_score,
+                        "hallucination_detected": judgment.hallucination_detected,
+                        "judge_reasoning": judgment.reasoning,
+                        
+                        # performance
+                        "latency_ms": latency_ms,
+                    }
+                    
+                    # status indicator
+                    ret_status = "CORRECT" if hit else "WRONG"
+                    faith_emoji = "PASSED" if judgment.faithfulness_score >= 0.7 else "ALMOST PASSED" if judgment.faithfulness_score >= 0.4 else "FAILED"
+                    halluc_flag = "HALLUC" if judgment.hallucination_detected else ""
+                    
+                    print(f"{ret_status} Ret | {faith_emoji} Faith={judgment.faithfulness_score:.2f} {halluc_flag}")
+                    if verbose:
+                        print(f"Reason: {judgment.reasoning[:80]}")
+                
+                else:
+                    result = {
+                        "question": question,
+                        "question_id": gold_item.get('id', f"q{i+1}"),
+                        "answer": answer or "(empty)",
+                        "retrieval_hit": hit,
+                        "recall_at_k": recall,
+                        "reciprocal_rank": rr,
+                        "faithfulness": 0.0,
+                        "relevance": 0.0,
+                        "hallucination_detected": False,
+                        "judge_reasoning": "Answer too short or empty",
+                        "latency_ms": latency_ms,
+                    }
+                    print(f"Empty or short answer")
+                
+                detailed_results.append(result)
+                
+            except Exception as e:
+                print(f"Error: {e}")
+                detailed_results.append({
+                    "question": question,
+                    "question_id": gold_item.get('id', f"q{i+1}"),
+                    "error": str(e),
+                })
+        
+        # aggregate metrics
+        valid_results = [r for r in detailed_results if "error" not in r]
+        n = len(valid_results)
+        
+        if n == 0:
+            print("\nAll evaluations failed")
+            return detailed_results, {}
+        
+        aggregate = {
+            "total_questions": len(gold_set),
+            "successful_evaluations": n,
+            
+            # retrieval
+            "retrieval_hit_rate": sum(r["retrieval_hit"] for r in valid_results) / n,
+            "mean_recall_at_k": sum(r["recall_at_k"] for r in valid_results) / n,
+            "mean_reciprocal_rank": sum(r.get("reciprocal_rank", 0) for r in valid_results) / n,
+            
+            # faithfulness
+            "mean_faithfulness": sum(r.get("faithfulness", 0) for r in valid_results) / n,
+            "mean_relevance": sum(r.get("relevance", 0) for r in valid_results) / n,
+            "mean_completeness": sum(r.get("completeness", 0) for r in valid_results) / n,
+            "mean_overall_quality": sum(r.get("overall_quality", 0) for r in valid_results) / n,
+            
+            # safety
+            "hallucination_rate": sum(r.get("hallucination_detected", False) for r in valid_results) / n,
+            "answers_below_faith_threshold": sum(
+                1 for r in valid_results 
+                if r.get("faithfulness", 1) < Config.Eval.FAITHFULNESS_THRESHOLD
+            ) / n,
+            
+            # performance
+            "mean_latency_ms": sum(r["latency_ms"] for r in valid_results) / n,
+        }
+        
+        print(f"\n{'='*60}")
+        print(f"EVALUATION SUMMARY")
+        print(f"{'='*60}")
+        print(f"Retrieval Hit Rate:     {aggregate['retrieval_hit_rate']:.1%}")
+        print(f"Mean Recall@{self.config.k}:         {aggregate['mean_recall_at_k']:.1%}")
+        print(f"---")
+        print(f"Mean Faithfulness:      {aggregate['mean_faithfulness']:.1%}")
+        print(f"Mean Relevance:         {aggregate['mean_relevance']:.1%}")
+        print(f"Overall Quality:        {aggregate['mean_overall_quality']:.1%}")
+        print(f"---")
+        print(f"Hallucination Rate:     {aggregate['hallucination_rate']:.1%}")
+        print(f"Below Threshold:        {aggregate['answers_below_faith_threshold']:.1%}")
+        print(f"---")
+        print(f"Avg Latency:            {aggregate['mean_latency_ms']:.0f}ms")
+        print(f"{'='*60}\n")
+        
+        # save detailed results
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        results_path = self.config.output_dir / f"eval_detailed_{timestamp}.json"
+        with open(results_path, 'w', encoding='utf-8') as f:
+            json.dump({
+                "aggregate": aggregate,
+                "detailed": detailed_results,
+            }, f, indent=2, ensure_ascii=False)
+        
+        print(f"Detailed results saved to: {results_path}\n")
+        
+        return detailed_results, aggregate
     
     def generate_report(
         self, results: List[RetrievalResult], metrics: EvalMetrics
